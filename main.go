@@ -1,29 +1,28 @@
 package main
 
 import (
-	"context"
+	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"strings"
 
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/codepipeline"
-	"github.com/aws/aws-sdk-go-v2/service/codepipeline/types"
-	"github.com/aws/aws-sdk-go-v2/service/lambda"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	// Import data layer functions from awsdata.go
+)
+
+// Add import for data functions
+//go:generate go run awsdata.go
+
+// Add cache variables for AWS resources
+var (
+	cachedBuckets   map[string][]string = make(map[string][]string) // profile -> buckets
+	cachedPipelines map[string][]string = make(map[string][]string) // profile -> pipelines
+	cachedLambdas   map[string][]string = make(map[string][]string) // profile -> lambdas
 )
 
 func getAWSProfiles() ([]string, error) {
-	cmd := exec.Command("aws", "configure", "list-profiles")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	return lines, nil
+	return ListAWSProfiles()
 }
 
 // Extract: Loads S3 buckets and updates the UI with a navigable list
@@ -33,18 +32,16 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 	log.Println("Starting goroutine to load S3 buckets")
 	
 	go func() {
-		cfgOpts := []func(*config.LoadOptions) error{config.WithSharedConfigProfile(selectedProfile)}
-		cfg, err := config.LoadDefaultConfig(context.Background(), cfgOpts...)
-		if err != nil {
-			log.Println("Failed to load AWS config:", err)
-			app.QueueUpdateDraw(func() {
-				mainPanel.SetText("Failed to load AWS config: " + err.Error())
-			})
-			return
+		var buckets []string
+		var err error
+		if b, ok := cachedBuckets[selectedProfile]; ok {
+			buckets = b
+		} else {
+			buckets, err = ListS3Buckets(selectedProfile)
+			if err == nil {
+				cachedBuckets[selectedProfile] = buckets
+			}
 		}
-		log.Println("Loaded AWS config, creating S3 client")
-		s3Client := s3.NewFromConfig(cfg)
-		result, err := s3Client.ListBuckets(context.Background(), &s3.ListBucketsInput{})
 		if err != nil {
 			log.Println("Failed to list S3 buckets:", err)
 			app.QueueUpdateDraw(func() {
@@ -52,13 +49,10 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 			})
 			return
 		}
-		log.Println("Fetched buckets, count:", len(result.Buckets))
+		log.Println("Fetched buckets, count:", len(buckets))
 
 		// Store all bucket names for filtering
-		allBuckets := make([]string, 0, len(result.Buckets))
-		for _, b := range result.Buckets {
-			allBuckets = append(allBuckets, *b.Name)
-		}
+		allBuckets := buckets
 
 		// Create filter input and bucket list
 		filterInput := tview.NewInputField().SetLabel("Filter: ")
@@ -66,17 +60,40 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 		filterInput.SetFieldBackgroundColor(tcell.ColorDefault)
 		filterInput.SetBorder(true).SetTitle("Bucket Filter")
 		bucketListWidget := tview.NewList().ShowSecondaryText(false)
+		
+		bucketListWidget.SetBackgroundColor(tcell.ColorDefault)
+
+		// After updateBucketList("") and before filterPanel creation
+		bucketCount := len(allBuckets)
+		bucketListWidget.SetBorder(true).SetTitle(fmt.Sprintf("S3 Buckets (%d)", bucketCount))
+
 		updateBucketList := func(filter string) {
 			bucketListWidget.Clear()
-			for _, name := range allBuckets {
+			visible := 0
+			selectedIdx := -1
+			for i, name := range allBuckets {
 				if filter == "" || strings.Contains(strings.ToLower(name), strings.ToLower(filter)) {
 					bucketListWidget.AddItem(name, "", 0, func(bucketName string) func() {
 						return func() {
 							showS3BucketContentsPanel(app, flex, mainPanel, menu, selectedProfile, bucketName, focusedPanel, contentPanel)
 						}
 					}(name))
+					visible++
+					if selectedIdx == -1 {
+						selectedIdx = i
+					}
 				}
 			}
+			current := bucketListWidget.GetCurrentItem()
+			if current < 0 {
+				current = 0
+			}
+			// Show selected bucket number (1-based) if any are visible
+			selectedDisplay := ""
+			if visible > 0 {
+				selectedDisplay = fmt.Sprintf(" | Selected: %d", current+1)
+			}
+			bucketListWidget.SetTitle(fmt.Sprintf("S3 Buckets (%d/%d%s)", visible, len(allBuckets), selectedDisplay))
 			if bucketListWidget.GetItemCount() > 0 {
 				bucketListWidget.SetCurrentItem(0)
 			}
@@ -89,7 +106,6 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 			AddItem(filterInput, 3, 0, false)
 		filterPanel.SetBorder(false)
 
-		bucketListWidget.SetBorder(true).SetTitle("S3 Buckets (use arrows)")
 		bucketListWidget.SetBackgroundColor(tcell.ColorDefault)
 		bucketListWidget.SetMainTextStyle(tcell.StyleDefault)
 		bucketListWidget.SetDoneFunc(func() {
@@ -122,6 +138,16 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 			return event
 		})
 
+		// Also update the title on selection change
+		bucketListWidget.SetChangedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
+			visible := bucketListWidget.GetItemCount()
+			selectedDisplay := ""
+			if visible > 0 {
+				selectedDisplay = fmt.Sprintf(" | Selected: %d", index+1)
+			}
+			bucketListWidget.SetTitle(fmt.Sprintf("S3 Buckets (%d/%d%s)", visible, len(allBuckets), selectedDisplay))
+		})
+
 		app.QueueUpdateDraw(func() {
 			log.Println("Switching to bucketList panel with filter at bottom")
 			flex.RemoveItem(mainPanel)
@@ -136,6 +162,8 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 func showS3BucketContentsPanel(app *tview.Application, flex *tview.Flex, mainPanel *tview.TextView, menu *tview.List, selectedProfile string, bucketName string, focusedPanel *int, contentPanel *tview.Primitive) {
 	objectList := tview.NewList().ShowSecondaryText(false)
 	objectList.SetBorder(true).SetTitle("Contents: " + bucketName)
+	objectList.SetBackgroundColor(tcell.ColorDefault)
+	objectList.SetMainTextStyle(tcell.StyleDefault)
 	objectList.SetDoneFunc(func() {
 		// Remove the content panel when done
 		app.QueueUpdateDraw(func() {
@@ -163,19 +191,7 @@ func showS3BucketContentsPanel(app *tview.Application, flex *tview.Flex, mainPan
 
 	log.Println("Loading contents for bucket:", bucketName)
 	go func() {
-		cfgOpts := []func(*config.LoadOptions) error{config.WithSharedConfigProfile(selectedProfile)}
-		cfg, err := config.LoadDefaultConfig(context.Background(), cfgOpts...)
-		if err != nil {
-			log.Println("Failed to load AWS config for bucket content:", err)
-			app.QueueUpdateDraw(func() {
-				objectList.AddItem("Failed to load AWS config: "+err.Error(), "", 0, nil)
-			})
-			return
-		}
-		s3Client := s3.NewFromConfig(cfg)
-		result, err := s3Client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
-			Bucket: &bucketName,
-		})
+		objects, err := ListS3Objects(selectedProfile, bucketName)
 		if err != nil {
 			log.Println("Failed to list objects in bucket:", err)
 			app.QueueUpdateDraw(func() {
@@ -183,21 +199,31 @@ func showS3BucketContentsPanel(app *tview.Application, flex *tview.Flex, mainPan
 			})
 			return
 		}
-		if len(result.Contents) == 0 {
+		if len(objects) == 0 {
 			app.QueueUpdateDraw(func() {
 				objectList.AddItem("(Bucket is empty)", "", 0, nil)
 			})
 		} else {
-			for _, obj := range result.Contents {
-				key := *obj.Key
+			for _, key := range objects {
 				objectList.AddItem(key, "", 0, func() {
 					log.Println("Selected object:", key)
 					// You can add more actions here for the selected object
 				})
 			}
 		}
+		// Show number of objects and selected object in the title
+		objectCount := len(objects)
+		objectList.SetTitle(fmt.Sprintf("Contents: %s (%d)", bucketName, objectCount))
 		app.QueueUpdateDraw(func() {
 			objectList.SetCurrentItem(0)
+		})
+		objectList.SetChangedFunc(func(index int, mainText, secondaryText string, shortcut rune) {
+			visible := objectList.GetItemCount()
+			selectedDisplay := ""
+			if visible > 0 {
+				selectedDisplay = fmt.Sprintf(" | %d", index+1)
+			}
+			objectList.SetTitle(fmt.Sprintf("Contents: %s (%d%s)", bucketName, visible, selectedDisplay))
 		})
 	}()
 	// Remove previous content panel if present
@@ -215,12 +241,11 @@ func downloadS3Object(app *tview.Application, selectedProfile, bucketName, objec
 	app.QueueUpdateDraw(func() {
 		mainPanel.SetText("Downloading: " + objectKey)
 	})
-	cmd := exec.Command("aws", "s3", "cp", "s3://"+bucketName+"/"+objectKey, "./"+objectKey, "--profile", selectedProfile)
-	output, err := cmd.CombinedOutput()
+	output, err := DownloadS3Object(selectedProfile, bucketName, objectKey)
 	if err != nil {
 		log.Printf("Failed to download %s: %v", objectKey, err)
 		app.QueueUpdateDraw(func() {
-			mainPanel.SetText("Failed to download: " + objectKey + "\n" + string(output))
+			mainPanel.SetText("Failed to download: " + objectKey + "\n" + output)
 		})
 		return
 	}
@@ -234,16 +259,16 @@ func downloadS3Object(app *tview.Application, selectedProfile, bucketName, objec
 func showCodePipelines(app *tview.Application, flex *tview.Flex, mainPanel *tview.TextView, menu *tview.List, selectedProfile string, focusedPanel *int, contentPanel *tview.Primitive) {
 	mainPanel.SetText("Loading CodePipelines...")
 	go func() {
-		cfgOpts := []func(*config.LoadOptions) error{config.WithSharedConfigProfile(selectedProfile)}
-		cfg, err := config.LoadDefaultConfig(context.Background(), cfgOpts...)
-		if err != nil {
-			app.QueueUpdateDraw(func() {
-				mainPanel.SetText("Failed to load AWS config: " + err.Error())
-			})
-			return
+		var pipelines []string
+		var err error
+		if p, ok := cachedPipelines[selectedProfile]; ok {
+			pipelines = p
+		} else {
+			pipelines, err = ListCodePipelines(selectedProfile)
+			if err == nil {
+				cachedPipelines[selectedProfile] = pipelines
+			}
 		}
-		client := codepipeline.NewFromConfig(cfg)
-		result, err := client.ListPipelines(context.Background(), &codepipeline.ListPipelinesInput{})
 		if err != nil {
 			app.QueueUpdateDraw(func() {
 				mainPanel.SetText("Failed to list CodePipelines: " + err.Error())
@@ -251,8 +276,7 @@ func showCodePipelines(app *tview.Application, flex *tview.Flex, mainPanel *tvie
 			return
 		}
 		pipelineList := tview.NewList().ShowSecondaryText(false)
-		for _, p := range result.Pipelines {
-			name := *p.Name
+		for _, name := range pipelines {
 			pipelineList.AddItem(name, "", 0, func(pipelineName string) func() {
 				return func() {
 					showCodePipelineDetails(app, flex, mainPanel, menu, selectedProfile, pipelineName, focusedPanel, contentPanel)
@@ -287,48 +311,13 @@ func showCodePipelines(app *tview.Application, flex *tview.Flex, mainPanel *tvie
 func showCodePipelineDetails(app *tview.Application, flex *tview.Flex, mainPanel *tview.TextView, menu *tview.List, selectedProfile, pipelineName string, focusedPanel *int, contentPanel *tview.Primitive) {
 	mainPanel.SetText("Loading details for pipeline: " + pipelineName)
 	go func() {
-		cfgOpts := []func(*config.LoadOptions) error{config.WithSharedConfigProfile(selectedProfile)}
-		cfg, err := config.LoadDefaultConfig(context.Background(), cfgOpts...)
-		if err != nil {
-			app.QueueUpdateDraw(func() {
-				mainPanel.SetText("Failed to load AWS config: " + err.Error())
-			})
-			return
-		}
-		client := codepipeline.NewFromConfig(cfg)
-		// Get pipeline structure
-		pipe, err := client.GetPipeline(context.Background(), &codepipeline.GetPipelineInput{
-			Name: &pipelineName,
-		})
+		pipe, stageStates, err := GetCodePipelineDetails(selectedProfile, pipelineName)
 		if err != nil {
 			app.QueueUpdateDraw(func() {
 				mainPanel.SetText("Failed to get pipeline details: " + err.Error())
 			})
 			return
 		}
-		// Get pipeline execution status
-		execs, err := client.ListPipelineExecutions(context.Background(), &codepipeline.ListPipelineExecutionsInput{
-			PipelineName: &pipelineName,
-			MaxResults: awsInt32(1),
-		})
-		var latestExec *types.PipelineExecutionSummary
-		if err == nil && len(execs.PipelineExecutionSummaries) > 0 {
-			latestExec = &execs.PipelineExecutionSummaries[0]
-		}
-		stageStates := make(map[string]types.StageState)
-		if latestExec != nil && latestExec.PipelineExecutionId != nil {
-			stateResp, err := client.GetPipelineState(context.Background(), &codepipeline.GetPipelineStateInput{
-				Name: &pipelineName,
-			})
-			if err == nil {
-				for _, s := range stateResp.StageStates {
-					if s.StageName != nil {
-						stageStates[*s.StageName] = s
-					}
-				}
-			}
-		}
-		// Build a navigable list for stages and actions with status
 		panel := tview.NewList().ShowSecondaryText(true)
 		for _, stage := range pipe.Pipeline.Stages {
 			stageName := *stage.Name
@@ -337,7 +326,6 @@ func showCodePipelineDetails(app *tview.Application, flex *tview.Flex, mainPanel
 				status = string(s.LatestExecution.Status)
 			}
 			panel.AddItem("Stage: "+stageName, "Status: "+status, 0, nil)
-			// Add actions for this stage
 			actionStates := make(map[string]string)
 			if s, ok := stageStates[stageName]; ok {
 				for _, a := range s.ActionStates {
@@ -385,13 +373,9 @@ func showCodePipelineActionLogs(app *tview.Application, flex *tview.Flex, mainPa
 	go func() {
 		// For simplicity, use AWS CLI to get logs (CloudWatch logs integration is required for full logs)
 		// This will just show a placeholder or error if not available
-		cmd := exec.Command("aws", "codepipeline", "get-pipeline-state", "--name", pipelineName, "--profile", selectedProfile)
-		output, err := cmd.CombinedOutput()
-		var logText string
+		logText, err := GetCodePipelineActionLogs(selectedProfile, pipelineName)
 		if err != nil {
-			logText = "Failed to get logs: " + err.Error() + "\n" + string(output)
-		} else {
-			logText = string(output)
+			logText = "Failed to get logs: " + err.Error() + "\n" + logText
 		}
 		panel := tview.NewTextView().SetText(logText)
 		panel.SetBorder(true).SetTitle("Logs: " + actionName)
@@ -411,16 +395,16 @@ func showCodePipelineActionLogs(app *tview.Application, flex *tview.Flex, mainPa
 func showLambdas(app *tview.Application, flex *tview.Flex, mainPanel *tview.TextView, menu *tview.List, selectedProfile string, focusedPanel *int, contentPanel *tview.Primitive) {
 	mainPanel.SetText("Loading Lambda functions...")
 	go func() {
-		cfgOpts := []func(*config.LoadOptions) error{config.WithSharedConfigProfile(selectedProfile)}
-		cfg, err := config.LoadDefaultConfig(context.Background(), cfgOpts...)
-		if err != nil {
-			app.QueueUpdateDraw(func() {
-				mainPanel.SetText("Failed to load AWS config: " + err.Error())
-			})
-			return
+		var lambdas []string
+		var err error
+		if l, ok := cachedLambdas[selectedProfile]; ok {
+			lambdas = l
+		} else {
+			lambdas, err = ListLambdas(selectedProfile)
+			if err == nil {
+				cachedLambdas[selectedProfile] = lambdas
+			}
 		}
-		client := lambda.NewFromConfig(cfg)
-		result, err := client.ListFunctions(context.Background(), &lambda.ListFunctionsInput{})
 		if err != nil {
 			app.QueueUpdateDraw(func() {
 				mainPanel.SetText("Failed to list Lambda functions: " + err.Error())
@@ -428,8 +412,7 @@ func showLambdas(app *tview.Application, flex *tview.Flex, mainPanel *tview.Text
 			return
 		}
 		lambdaList := tview.NewList().ShowSecondaryText(false)
-		for _, f := range result.Functions {
-			name := *f.FunctionName
+		for _, name := range lambdas {
 			lambdaList.AddItem(name, "", 0, nil)
 		}
 		lambdaList.SetBorder(true).SetTitle("Lambda Functions (use arrows)")
@@ -456,37 +439,6 @@ func showLambdas(app *tview.Application, flex *tview.Flex, mainPanel *tview.Text
 	}()
 }
 
-// Utility: Remove any right-side panels (bucket list, codepipeline, lambda, content, etc.)
-func removeRightPanels(flex *tview.Flex, mainPanel *tview.TextView) {
-	for flex.GetItemCount() > 1 {
-		flex.RemoveItem(flex.GetItem(1))
-	}
-	flex.AddItem(mainPanel, 0, 3, false)
-}
-
-// Helper for *int32
-func awsInt32(v int) *int32 {
-	t := int32(v)
-	return &t
-}
-
-// Set transparent background for all tview primitives and remove borders for text panels
-func setTransparentBackground(p tview.Primitive) {
-	switch v := p.(type) {
-	case *tview.TextView:
-		v.SetBackgroundColor(tcell.ColorDefault)
-		v.SetBorder(false)
-	case *tview.List:
-		v.SetBackgroundColor(tcell.ColorDefault)
-	case *tview.InputField:
-		v.SetBackgroundColor(tcell.ColorDefault)
-	case *tview.Flex:
-		for i := 0; i < v.GetItemCount(); i++ {
-			setTransparentBackground(v.GetItem(i))
-		}
-	}
-}
-
 func main() {
 	// Log to file
 	logFile, err := os.OpenFile("lazyaws.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -499,7 +451,6 @@ func main() {
 
 	profilePanel := tview.NewList().ShowSecondaryText(false)
 	mainPanel := tview.NewTextView().SetText("Select a functionality from the left panel.")
-	mainPanel.SetBackgroundColor(tcell.ColorDefault)
 
 	profiles, err := getAWSProfiles()
 	if err != nil || len(profiles) == 0 {
@@ -512,46 +463,107 @@ func main() {
 	// Define flex before using it in the profilePanel callback
 	var flex *tview.Flex
 
-	// Track which panel is focused: 0 = menu, 1 = mainPanel/bucketList
+	// New: Add a resource list panel below the menu
+	var resourceList *tview.List
+	resourceList = tview.NewList().ShowSecondaryText(false)
+	resourceList.SetBorder(true).SetTitle("Resources")
+	resourceList.SetBackgroundColor(tcell.ColorDefault)
+	resourceList.SetMainTextStyle(tcell.StyleDefault)
+
+	// Track which panel is focused: 0 = menu, 1 = resourceList, 2 = contentPanel
 	focusedPanel := 0
-	var bucketList *tview.List
-	// Declare contentPanel before showS3Buckets so it is in scope
+	var bucketList *tview.List // no longer used for left panel, but keep for content
 	var contentPanel tview.Primitive
 
-	// Declare menu before its use in bucketList.SetDoneFunc
+	// Declare menu before its use in resourceList
 	var menu *tview.List
 	menu = tview.NewList().
 		AddItem("S3", "", '1', func() {
-			removeRightPanels(flex, mainPanel)
-			log.Println("S3 menu item selected. bucketList pointer:", bucketList)
-			// Defensive: check if bucketList is not nil and is still in the flex layout
-			if bucketList != nil {
-				found := false
-				for i := 0; i < flex.GetItemCount(); i++ {
-					if flex.GetItem(i) == bucketList {
-						found = true
-						break
-					}
-				}
-				log.Println("bucketList found in flex:", found)
-				if found {
-					// bucketList is in flex, so just focus it
-					app.SetFocus(bucketList)
-				} else {
-					
-				}
+			// When S3 is selected, show S3 buckets in resourceList
+			resourceList.Clear()
+			resourceList.SetTitle("S3 Buckets")
+			var buckets []string
+			var err error
+			if b, ok := cachedBuckets[selectedProfile]; ok {
+				buckets = b
 			} else {
-				showS3Buckets(app, flex, mainPanel, menu, selectedProfile, &focusedPanel, &bucketList, &contentPanel)		
+				buckets, err = ListS3Buckets(selectedProfile)
+				if err == nil {
+					cachedBuckets[selectedProfile] = buckets
+				}
 			}
-			
+			if err != nil {
+				resourceList.AddItem("Failed to load buckets: "+err.Error(), "", 0, nil)
+				return
+			}
+			for _, name := range buckets {
+				resourceList.AddItem(name, "", 0, func(bucketName string) func() {
+					return func() {
+						showS3BucketContentsPanel(app, flex, mainPanel, menu, selectedProfile, bucketName, &focusedPanel, &contentPanel)
+					}
+				}(name))
+			}
+			if resourceList.GetItemCount() > 0 {
+				resourceList.SetCurrentItem(0)
+			}
+			app.SetFocus(resourceList)
+			focusedPanel = 1
 		}).
 		AddItem("CodePipeline", "Manage CodePipelines", '3', func() {
-			removeRightPanels(flex, mainPanel)
-			showCodePipelines(app, flex, mainPanel, menu, selectedProfile, &focusedPanel, &contentPanel)
+			resourceList.Clear()
+			resourceList.SetTitle("Pipelines")
+			var pipelines []string
+			var err error
+			if p, ok := cachedPipelines[selectedProfile]; ok {
+				pipelines = p
+			} else {
+				pipelines, err = ListCodePipelines(selectedProfile)
+				if err == nil {
+					cachedPipelines[selectedProfile] = pipelines
+				}
+			}
+			if err != nil {
+				resourceList.AddItem("Failed to load pipelines: "+err.Error(), "", 0, nil)
+				return
+			}
+			for _, name := range pipelines {
+				resourceList.AddItem(name, "", 0, func(pipelineName string) func() {
+					return func() {
+						showCodePipelineDetails(app, flex, mainPanel, menu, selectedProfile, pipelineName, &focusedPanel, &contentPanel)
+					}
+				}(name))
+			}
+			if resourceList.GetItemCount() > 0 {
+				resourceList.SetCurrentItem(0)
+			}
+			app.SetFocus(resourceList)
+			focusedPanel = 1
 		}).
 		AddItem("Lambda", "Manage Lambda functions", '4', func() {
-			removeRightPanels(flex, mainPanel)
-			showLambdas(app, flex, mainPanel, menu, selectedProfile, &focusedPanel, &contentPanel)
+			resourceList.Clear()
+			resourceList.SetTitle("Lambdas")
+			var lambdas []string
+			var err error
+			if l, ok := cachedLambdas[selectedProfile]; ok {
+				lambdas = l
+			} else {
+				lambdas, err = ListLambdas(selectedProfile)
+				if err == nil {
+					cachedLambdas[selectedProfile] = lambdas
+				}
+			}
+			if err != nil {
+				resourceList.AddItem("Failed to load lambdas: "+err.Error(), "", 0, nil)
+				return
+			}
+			for _, name := range lambdas {
+				resourceList.AddItem(name, "", 0, nil)
+			}
+			if resourceList.GetItemCount() > 0 {
+				resourceList.SetCurrentItem(0)
+			}
+			app.SetFocus(resourceList)
+			focusedPanel = 1
 		}).
 		AddItem("Quit", "Exit LazyAWS", 'q', func() { app.Stop() })
 	menu.SetBorder(true).SetTitle("Functionalities")
@@ -560,8 +572,12 @@ func main() {
 	menu.SetSecondaryTextStyle(tcell.StyleDefault)
 	menu.ShowSecondaryText(false)
 
-	flex = tview.NewFlex().
-		AddItem(menu, 30, 1, true).
+	// New flex layout: left column is menu + resourceList, right is mainPanel/content
+	leftFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(menu, 0, 1, true).
+		AddItem(resourceList, 0, 2, false)
+	flex = tview.NewFlex().SetDirection(tview.FlexColumn).
+		AddItem(leftFlex, 30, 1, true).
 		AddItem(mainPanel, 0, 3, false)
 
 	for _, p := range profiles {
@@ -589,24 +605,48 @@ func main() {
 			app.Stop()
 		}
 		if event.Key() == tcell.KeyTAB {
-			if focusedPanel == 0 {
-				// Focus main panel (bucketList if present, else mainPanel)
-				if bucketList != nil && flex.GetItemCount() > 1 {
-					// tview.Flex does not have GetItemAt, so we track if bucketList is present by checking if mainPanel is not present
-					app.SetFocus(bucketList)
-					focusedPanel = 1
-				} else {
-					app.SetFocus(mainPanel)
-					focusedPanel = 1
+			//add log
+			
+			// Cycle focus through all open panels (menu, mainPanel, bucketList, contentPanel)
+			panels := []tview.Primitive{menu, mainPanel}
+			if bucketList != nil && flex.GetItemCount() > 1 {
+				panels = append(panels, bucketList)
+			}
+			if contentPanel != nil && flex.GetItemCount() > 2 {
+				panels = append(panels, contentPanel)
+			}
+			// Find current focus and move to next
+			current := app.GetFocus()
+			//log current 
+		
+			idx := 0
+			for i, p := range panels {
+				if current == p {
+					idx = i
+					break
 				}
-			} else {
-				app.SetFocus(menu)
-				focusedPanel = 0
+			}
+			next := (idx + 1) % len(panels)
+			app.SetFocus(panels[next])
+			// Set border color for all panels
+			for i, p := range panels {
+				setPanelBorderColor(app, p, i == next)
 			}
 			return nil // prevent further handling
 		}
 		return event
 	})
+
+	// After each panel creation and when focus changes, call setPanelBorderColor to update border color
+	// For initial state, set menu as focused
+	setPanelBorderColor(app, menu, true)
+	setPanelBorderColor(app, mainPanel, false)
+	if bucketList != nil {
+		setPanelBorderColor(app, bucketList, false)
+	}
+	if contentPanel != nil {
+		setPanelBorderColor(app, contentPanel, false)
+	}
 
 	app.SetRoot(profilePanel, true)
 	if err := app.Run(); err != nil {
