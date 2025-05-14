@@ -23,7 +23,7 @@ func getAWSProfiles() ([]string, error) {
 }
 
 // Extract: Loads S3 buckets and updates the UI with a navigable list
-func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.TextView, menu *tview.List, selectedProfile string, focusedPanel *int, bucketList **tview.List) {
+func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.TextView, menu *tview.List, selectedProfile string, focusedPanel *int, bucketList **tview.List, contentPanel **tview.TextView) {
 	mainPanel.SetText("Loading S3 buckets...")
 	log.Println("Starting goroutine to load S3 buckets")
 	go func() {
@@ -50,7 +50,11 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 		blist := tview.NewList().ShowSecondaryText(false)
 		for _, b := range result.Buckets {
 			name := *b.Name
-			blist.AddItem(name, "", 0, nil)
+			blist.AddItem(name, "", 0, func(bucketName string) func() {
+				return func() {
+					showS3BucketContentsPanel(app, flex, mainPanel, menu, selectedProfile, bucketName, focusedPanel, contentPanel)
+				}
+			}(name))
 		}
 		blist.SetBorder(true).SetTitle("S3 Buckets (use arrows)")
 		blist.SetDoneFunc(func() {
@@ -73,6 +77,50 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 			*bucketList = blist
 		})
 	}()
+}
+
+func showS3BucketContentsPanel(app *tview.Application, flex *tview.Flex, mainPanel *tview.TextView, menu *tview.List, selectedProfile string, bucketName string, focusedPanel *int, contentPanel **tview.TextView) {
+	panel := tview.NewTextView().SetText("Loading bucket contents for: " + bucketName)
+	panel.SetBorder(true).SetTitle("Contents: " + bucketName)
+	log.Println("Loading contents for bucket:", bucketName)
+	go func() {
+		cfgOpts := []func(*config.LoadOptions) error{config.WithSharedConfigProfile(selectedProfile)}
+		cfg, err := config.LoadDefaultConfig(context.Background(), cfgOpts...)
+		if err != nil {
+			log.Println("Failed to load AWS config for bucket content:", err)
+			app.QueueUpdateDraw(func() {
+				panel.SetText("Failed to load AWS config: " + err.Error())
+			})
+			return
+		}
+		s3Client := s3.NewFromConfig(cfg)
+		result, err := s3Client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+			Bucket: &bucketName,
+		})
+		if err != nil {
+			log.Println("Failed to list objects in bucket:", err)
+			app.QueueUpdateDraw(func() {
+				panel.SetText("Failed to list objects in bucket: " + err.Error())
+			})
+			return
+		}
+		var content strings.Builder
+		content.WriteString("Objects in bucket '" + bucketName + "':\n")
+		for _, obj := range result.Contents {
+			content.WriteString(*obj.Key + "\n")
+		}
+		app.QueueUpdateDraw(func() {
+			panel.SetText(content.String())
+		})
+	}()
+	// Remove previous content panel if present
+	if *contentPanel != nil {
+		flex.RemoveItem(*contentPanel)
+	}
+	*contentPanel = panel
+	flex.AddItem(panel, 0, 2, false)
+	*focusedPanel = 2
+	app.SetFocus(panel)
 }
 
 func main() {
@@ -102,6 +150,8 @@ func main() {
 	// Track which panel is focused: 0 = menu, 1 = mainPanel/bucketList
 	focusedPanel := 0
 	var bucketList *tview.List
+	// Declare contentPanel before showS3Buckets so it is in scope
+	var contentPanel *tview.TextView
 
 	// Declare menu before its use in bucketList.SetDoneFunc
 	var menu *tview.List
@@ -125,7 +175,7 @@ func main() {
 					
 				}
 			} else {
-				showS3Buckets(app, flex, mainPanel, menu, selectedProfile, &focusedPanel, &bucketList)		
+				showS3Buckets(app, flex, mainPanel, menu, selectedProfile, &focusedPanel, &bucketList, &contentPanel)		
 			}
 			
 		}).
