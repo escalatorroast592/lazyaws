@@ -38,7 +38,13 @@ func main() {
 	// Define flex before using it in the profilePanel callback
 	var flex *tview.Flex
 
-	menu := tview.NewList().
+	// Track which panel is focused: 0 = menu, 1 = mainPanel/bucketList
+	focusedPanel := 0
+	var bucketList *tview.List
+
+	// Declare menu before its use in bucketList.SetDoneFunc
+	var menu *tview.List
+	menu = tview.NewList().
 		AddItem("S3", "Manage S3 buckets", '1', func() {
 			mainPanel.SetText("Loading S3 buckets...")
 			go func() {
@@ -58,17 +64,26 @@ func main() {
 					})
 					return
 				}
-				bucketList := tview.NewList().ShowSecondaryText(false)
+				bucketList = tview.NewList().ShowSecondaryText(false)
 				for _, b := range result.Buckets {
 					name := *b.Name
 					bucketList.AddItem(name, "", 0, nil)
 				}
 				bucketList.SetBorder(true).SetTitle("S3 Buckets (use arrows)")
 				bucketList.SetDoneFunc(func() {
-					app.SetRoot(flex, true)
+					// Restore the mainPanel when done
+					app.QueueUpdateDraw(func() {
+						flex.RemoveItem(bucketList)
+						flex.AddItem(mainPanel, 0, 3, false)
+						focusedPanel = 0
+						app.SetFocus(menu)
+					})
 				})
 				app.QueueUpdateDraw(func() {
-					app.SetRoot(bucketList, true)
+					flex.RemoveItem(mainPanel)
+					flex.AddItem(bucketList, 0, 3, false)
+					focusedPanel = 1
+					app.SetFocus(bucketList)
 				})
 			}()
 		}).
@@ -76,12 +91,7 @@ func main() {
 		AddItem("CodePipeline", "Manage CodePipelines", '3', nil).
 		AddItem("Lambda", "Manage Lambda functions", '4', nil).
 		AddItem("Quit", "Exit LazyAWS", 'q', func() { app.Stop() })
-
-	menu.SetChangedFunc(func(index int, mainText string, secondaryText string, shortcut rune) {
-		if mainText != "S3" {
-			mainPanel.SetText("Selected: " + mainText)
-		}
-	})
+	menu.SetBorder(true).SetTitle("Functionalities")
 
 	flex = tview.NewFlex().
 		AddItem(menu, 30, 1, true).
@@ -104,6 +114,23 @@ func main() {
 		}
 		if event.Key() == tcell.KeyCtrlC {
 			app.Stop()
+		}
+		if event.Key() == tcell.KeyTAB {
+			if focusedPanel == 0 {
+				// Focus main panel (bucketList if present, else mainPanel)
+				if bucketList != nil && flex.GetItemCount() > 1 {
+					// tview.Flex does not have GetItemAt, so we track if bucketList is present by checking if mainPanel is not present
+					app.SetFocus(bucketList)
+					focusedPanel = 1
+				} else {
+					app.SetFocus(mainPanel)
+					focusedPanel = 1
+				}
+			} else {
+				app.SetFocus(menu)
+				focusedPanel = 0
+			}
+			return nil // prevent further handling
 		}
 		return event
 	})
