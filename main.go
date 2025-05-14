@@ -9,6 +9,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"os"
 )
 
 func getAWSProfiles() ([]string, error) {
@@ -21,7 +22,67 @@ func getAWSProfiles() ([]string, error) {
 	return lines, nil
 }
 
+// Extract: Loads S3 buckets and updates the UI with a navigable list
+func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.TextView, menu *tview.List, selectedProfile string, focusedPanel *int, bucketList **tview.List) {
+	mainPanel.SetText("Loading S3 buckets...")
+	log.Println("Starting goroutine to load S3 buckets")
+	go func() {
+		cfgOpts := []func(*config.LoadOptions) error{config.WithSharedConfigProfile(selectedProfile)}
+		cfg, err := config.LoadDefaultConfig(context.Background(), cfgOpts...)
+		if err != nil {
+			log.Println("Failed to load AWS config:", err)
+			app.QueueUpdateDraw(func() {
+				mainPanel.SetText("Failed to load AWS config: " + err.Error())
+			})
+			return
+		}
+		log.Println("Loaded AWS config, creating S3 client")
+		s3Client := s3.NewFromConfig(cfg)
+		result, err := s3Client.ListBuckets(context.Background(), &s3.ListBucketsInput{})
+		if err != nil {
+			log.Println("Failed to list S3 buckets:", err)
+			app.QueueUpdateDraw(func() {
+				mainPanel.SetText("Failed to list S3 buckets: " + err.Error())
+			})
+			return
+		}
+		log.Println("Fetched buckets, count:", len(result.Buckets))
+		blist := tview.NewList().ShowSecondaryText(false)
+		for _, b := range result.Buckets {
+			name := *b.Name
+			blist.AddItem(name, "", 0, nil)
+		}
+		blist.SetBorder(true).SetTitle("S3 Buckets (use arrows)")
+		blist.SetDoneFunc(func() {
+			log.Println("bucketList done, restoring mainPanel")
+			app.QueueUpdateDraw(func() {
+				flex.RemoveItem(blist)
+				flex.AddItem(mainPanel, 0, 3, false)
+				*focusedPanel = 0
+				app.SetFocus(menu)
+				*bucketList = nil // allow reopening
+				log.Println("bucketList set to nil after done")
+			})
+		})
+		app.QueueUpdateDraw(func() {
+			log.Println("Switching to bucketList panel")
+			flex.RemoveItem(mainPanel)
+			flex.AddItem(blist, 0, 3, false)
+			*focusedPanel = 1
+			app.SetFocus(blist)
+			*bucketList = blist
+		})
+	}()
+}
+
 func main() {
+	// Log to file
+	logFile, err := os.OpenFile("lazyaws.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("Failed to open log file: %v", err)
+	}
+	log.SetOutput(logFile)
+
 	app := tview.NewApplication()
 
 	profilePanel := tview.NewList().ShowSecondaryText(false)
@@ -46,46 +107,27 @@ func main() {
 	var menu *tview.List
 	menu = tview.NewList().
 		AddItem("S3", "Manage S3 buckets", '1', func() {
-			mainPanel.SetText("Loading S3 buckets...")
-			go func() {
-				cfgOpts := []func(*config.LoadOptions) error{config.WithSharedConfigProfile(selectedProfile)}
-				cfg, err := config.LoadDefaultConfig(context.Background(), cfgOpts...)
-				if err != nil {
-					app.QueueUpdateDraw(func() {
-						mainPanel.SetText("Failed to load AWS config: " + err.Error())
-					})
-					return
+			log.Println("S3 menu item selected. bucketList pointer:", bucketList)
+			// Defensive: check if bucketList is not nil and is still in the flex layout
+			if bucketList != nil {
+				found := false
+				for i := 0; i < flex.GetItemCount(); i++ {
+					if flex.GetItem(i) == bucketList {
+						found = true
+						break
+					}
 				}
-				s3Client := s3.NewFromConfig(cfg)
-				result, err := s3Client.ListBuckets(context.Background(), &s3.ListBucketsInput{})
-				if err != nil {
-					app.QueueUpdateDraw(func() {
-						mainPanel.SetText("Failed to list S3 buckets: " + err.Error())
-					})
-					return
-				}
-				bucketList = tview.NewList().ShowSecondaryText(false)
-				for _, b := range result.Buckets {
-					name := *b.Name
-					bucketList.AddItem(name, "", 0, nil)
-				}
-				bucketList.SetBorder(true).SetTitle("S3 Buckets (use arrows)")
-				bucketList.SetDoneFunc(func() {
-					// Restore the mainPanel when done
-					app.QueueUpdateDraw(func() {
-						flex.RemoveItem(bucketList)
-						flex.AddItem(mainPanel, 0, 3, false)
-						focusedPanel = 0
-						app.SetFocus(menu)
-					})
-				})
-				app.QueueUpdateDraw(func() {
-					flex.RemoveItem(mainPanel)
-					flex.AddItem(bucketList, 0, 3, false)
-					focusedPanel = 1
+				log.Println("bucketList found in flex:", found)
+				if found {
+					// bucketList is in flex, so just focus it
 					app.SetFocus(bucketList)
-				})
-			}()
+				} else {
+					
+				}
+			} else {
+				showS3Buckets(app, flex, mainPanel, menu, selectedProfile, &focusedPanel, &bucketList)		
+			}
+			
 		}).
 		AddItem("EC2", "Manage EC2 instances", '2', nil).
 		AddItem("CodePipeline", "Manage CodePipelines", '3', nil).
