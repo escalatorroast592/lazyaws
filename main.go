@@ -58,12 +58,17 @@ func main() {
 					})
 					return
 				}
-				buckets := "S3 Buckets:\n"
+				bucketList := tview.NewList().ShowSecondaryText(false)
 				for _, b := range result.Buckets {
-					buckets += *b.Name + "\n"
+					name := *b.Name
+					bucketList.AddItem(name, "", 0, nil)
 				}
+				bucketList.SetBorder(true).SetTitle("S3 Buckets (use arrows)")
+				bucketList.SetDoneFunc(func() {
+					app.SetRoot(flex, true)
+				})
 				app.QueueUpdateDraw(func() {
-					mainPanel.SetText(buckets)
+					app.SetRoot(bucketList, true)
 				})
 			}()
 		}).
