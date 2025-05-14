@@ -31,6 +31,7 @@ func getAWSProfiles() ([]string, error) {
 func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.TextView, menu *tview.List, selectedProfile string, focusedPanel *int, bucketList **tview.List, contentPanel *tview.Primitive) {
 	mainPanel.SetText("Loading S3 buckets...")
 	log.Println("Starting goroutine to load S3 buckets")
+	
 	go func() {
 		cfgOpts := []func(*config.LoadOptions) error{config.WithSharedConfigProfile(selectedProfile)}
 		cfg, err := config.LoadDefaultConfig(context.Background(), cfgOpts...)
@@ -61,6 +62,8 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 
 		// Create filter input and bucket list
 		filterInput := tview.NewInputField().SetLabel("Filter: ")
+		filterInput.SetBackgroundColor(tcell.ColorDefault)
+		filterInput.SetFieldBackgroundColor(tcell.ColorDefault)
 		filterInput.SetBorder(true).SetTitle("Bucket Filter")
 		bucketListWidget := tview.NewList().ShowSecondaryText(false)
 		updateBucketList := func(filter string) {
@@ -87,6 +90,8 @@ func showS3Buckets(app *tview.Application, flex *tview.Flex, mainPanel *tview.Te
 		filterPanel.SetBorder(false)
 
 		bucketListWidget.SetBorder(true).SetTitle("S3 Buckets (use arrows)")
+		bucketListWidget.SetBackgroundColor(tcell.ColorDefault)
+		bucketListWidget.SetMainTextStyle(tcell.StyleDefault)
 		bucketListWidget.SetDoneFunc(func() {
 			log.Println("bucketList done, restoring mainPanel")
 			app.QueueUpdateDraw(func() {
@@ -465,6 +470,23 @@ func awsInt32(v int) *int32 {
 	return &t
 }
 
+// Set transparent background for all tview primitives and remove borders for text panels
+func setTransparentBackground(p tview.Primitive) {
+	switch v := p.(type) {
+	case *tview.TextView:
+		v.SetBackgroundColor(tcell.ColorDefault)
+		v.SetBorder(false)
+	case *tview.List:
+		v.SetBackgroundColor(tcell.ColorDefault)
+	case *tview.InputField:
+		v.SetBackgroundColor(tcell.ColorDefault)
+	case *tview.Flex:
+		for i := 0; i < v.GetItemCount(); i++ {
+			setTransparentBackground(v.GetItem(i))
+		}
+	}
+}
+
 func main() {
 	// Log to file
 	logFile, err := os.OpenFile("lazyaws.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -477,6 +499,7 @@ func main() {
 
 	profilePanel := tview.NewList().ShowSecondaryText(false)
 	mainPanel := tview.NewTextView().SetText("Select a functionality from the left panel.")
+	mainPanel.SetBackgroundColor(tcell.ColorDefault)
 
 	profiles, err := getAWSProfiles()
 	if err != nil || len(profiles) == 0 {
@@ -498,7 +521,7 @@ func main() {
 	// Declare menu before its use in bucketList.SetDoneFunc
 	var menu *tview.List
 	menu = tview.NewList().
-		AddItem("S3", "Manage S3 buckets", '1', func() {
+		AddItem("S3", "", '1', func() {
 			removeRightPanels(flex, mainPanel)
 			log.Println("S3 menu item selected. bucketList pointer:", bucketList)
 			// Defensive: check if bucketList is not nil and is still in the flex layout
@@ -532,6 +555,10 @@ func main() {
 		}).
 		AddItem("Quit", "Exit LazyAWS", 'q', func() { app.Stop() })
 	menu.SetBorder(true).SetTitle("Functionalities")
+	menu.SetBackgroundColor(tcell.ColorDefault)
+	menu.SetMainTextStyle(tcell.StyleDefault)
+	menu.SetSecondaryTextStyle(tcell.StyleDefault)
+	menu.ShowSecondaryText(false)
 
 	flex = tview.NewFlex().
 		AddItem(menu, 30, 1, true).
@@ -546,6 +573,12 @@ func main() {
 	}
 
 	profilePanel.SetBorder(true).SetTitle("Select AWS Profile")
+
+	// In main, after creating all panels and before app.SetRoot, set transparent backgrounds and remove text borders
+	setTransparentBackground(menu)
+	setTransparentBackground(mainPanel)
+	setTransparentBackground(profilePanel)
+	setTransparentBackground(flex)
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Rune() {
